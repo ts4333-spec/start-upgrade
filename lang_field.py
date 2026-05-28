@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 import html
 import time
+import json
 from collections import defaultdict
 from typing import Callable, Optional, Dict, Any, List
 
@@ -404,74 +405,103 @@ $h=[ISDS 코드]"""
         self, title: str, category_text: str, publisher: str, author: str, translator: str,
         original_title: str, author_bio: str, translator_bio: str, label: str = "Hybrid-Nonfiction"
     ) -> Optional[str]:
-        """Fast Track(저자 단서) 평가 후 부족 시 Safe Track(역자 커리어 폴백) 가동"""
+        """Fast Track(저자 단서) 및 Safe Track(역자 커리어 폴백) 데이터를 JSON으로 묶어 
+        trans.py 수준의 강력한 강제 규칙(규칙 A~E)과 함께 단일 호출로 처리합니다."""
         if not self._client: return None
 
-        # 1. Fast Track (저자 단서 분석 - API 호출 없음)
-        author_script_weights = _script_weights_on_text(f"{title} {original_title} {author_bio[:500]}")
+        # 1. 저자 및 도서 데이터 구조화 (글자 수 제한 대폭 확대 400 -> 3000)
+        author_script_weights = _script_weights_on_text(f"{title} {original_title} {author_bio[:2000]}")
         author_major_info = extract_univ_major_regex(author_bio)
         
-        author_confidence = "low"
-        if author_major_info and author_major_info.get("inferred_language"):
-            author_confidence = "high"
-            self._dbg(f"⚡ [Fast Track] 저자 전공 단서 발견: {author_major_info['inferred_language']}")
-        elif sum(author_script_weights.values()) >= 2.0:
-            author_confidence = "medium"
-            self._dbg(f"⚡ [Fast Track] 도서/저자 문자 가중치 유의미: {author_script_weights}")
+        authors_info = [{
+            "name": author,
+            "bio_excerpt": author_bio[:3000] if author_bio else None,
+            "script_weights": author_script_weights,
+            "univ_major_regex": author_major_info
+        }]
 
-        # 2. Safe Track (역자 폴백 - 저자 단서가 부족할 때만 가동!)
-        translator_major_info = None
-        translator_career_summary = ""
-        if author_confidence == "low" and (translator_bio or translator):
-            self._dbg("🛡️ [Safe Track] 저자 단서 부족. 역자 폴백 가동...")
-            if translator_bio:
-                translator_major_info = extract_univ_major_regex(translator_bio)
+        book_info = {
+            "title": title,
+            "original_title": original_title or None,
+            "categoryName": category_text,
+            "publisher": publisher,
+            "script_weights": _script_weights_on_text(title + " " + (original_title or ""))
+        }
+
+        # 2. 역자 데이터 구조화 및 커리어 힌트 수집 (Safe Track)
+        translators_info = []
+        if translator_bio or translator:
+            translator_major_info = extract_univ_major_regex(translator_bio) if translator_bio else None
+            career_counts = {}
+            filtered_count = 0
+            
             if translator and self._ttbkey:
                 career_items = self._scraper.fetch_translator_career(translator, self._ttbkey)
                 if career_items:
+                    # 대분류 카테고리가 일치하는 번역 이력만 필터링
                     valid_careers = [b for b in career_items if b.get('categoryName', '').split('>')[0] in category_text]
-                    translator_career_summary = f"({len(valid_careers)}권 번역 이력 발견)"
+                    filtered_count = len(valid_careers)
+                    for b in valid_careers:
+                        t_ot = (b.get("subInfo", {}).get("originalTitle") or "")
+                        t_title = b.get("title", "")
+                        for k, v in _script_weights_on_text(f"{t_title} {t_ot}").items():
+                            career_counts[k] = career_counts.get(k, 0.0) + v
+                            
+            translators_info.append({
+                "name": translator,
+                "bio_excerpt": translator_bio[:3000] if translator_bio else None,
+                "univ_major_regex": translator_major_info,
+                "career_hint_counts": career_counts,
+                "filtered_translator_book_count": filtered_count
+            })
 
-        # 3. GPT 프롬프트 주입
-        prompt = f"""아래 도서의 원서 언어(041 $h)를 ISDS 코드로 추정해.
-가능한 코드: kor, eng, jpn, chi, rus, fre, ger, ita, spa, por, tur
+        # 3. trans.py의 강력한 통제 프롬프트 주입 (ISDS 코드 출력 맞춤형)
+        system = """당신은 **한국어로 번역·출간된 외국 도서**의 **원서 언어(041 $h)**를 ISDS 코드로 추론하는 사서 전문 AI입니다.
+입력은 알라딘 번역서 데이터입니다. 한국어 제목·'국내도서' 분류는 번역본 유통 정보일 뿐, 원서가 한국어라는 증거가 **절대 아닙니다**.
 
-[도서 기본]
-- 제목: {title} / 원제: {original_title or "(없음)"} / 분류: {category_text}
+[최우선 금지·강제 규칙]
+1. 규칙 A. '국내도서' ≠ 한국어 원서: book.categoryName에 '국내도서'가 있어도 한국어(kor) 판정의 근거로 쓰지 마세요. 위반 시 치명적 오판입니다.
+2. 규칙 B. 외국인 이름 음차: 저자 이름이 외국인 음차(예: 아나스타샤, 톰 스미스 등)이면 bio가 부실해도 한국어(kor) 판정 절대 금지.
+3. 규칙 D. 도서 제목 고유명사: title에 지브리, 마블 등 특정 국가를 지시하는 명확한 IP/고유명사가 있으면 최우선으로 해당 국가 언어로 판정.
+4. 규칙 C. 번역가 폴백: 저자 단서가 부족하거나(단체명 등) 외국인 이름인데 원서 특정 불가 시, translators[]의 전공(univ_major_regex) 및 커리어(career_hint_counts)를 즉시·적극 수용하세요.
+5. 규칙 E. 한국계·해외파 저자: 저자 이름이 한국식이어도 bio에 영미권 대학/해외 매체 활동이 주축이면 영어(eng) 등 해당 언어로 판정하세요.
 
-[1순위: 저자(Fast Track) 분석 결과]
-- 저자명: {author}
-- 저자 전공 추출: {author_major_info}
-- 저자/도서 문자 가중치: {author_script_weights}
-- 저자 소개글: {author_bio[:400]}
+반드시 JSON 객체 하나만 반환하세요.
+{
+  "reasoning_process": "string (한국어, 단계별 추론 과정 요약)",
+  "author_signal_confidence": "high|medium|low",
+  "is_indirect_translation": boolean (중역 의심 여부),
+  "isds_code": "string (가능한 코드: kor, eng, jpn, chi, rus, fre, ger, ita, spa, por, tur. 알 수 없으면 und)"
+}"""
 
-[2순위: 역자(Safe Track) 분석 결과 (저자 정보 부족시 참고)]
-- 역자명: {translator}
-- 역자 전공 추출: {translator_major_info}
-- 역자 커리어 요약: {translator_career_summary if translator_career_summary else '(분석 안함)'}
-- 역자 소개글: {translator_bio[:400]}
-
-[지침]
-1. 1순위 저자의 전공(inferred_language)이나 문자 가중치가 뚜렷하면 최우선으로 적용.
-2. 저자 정보가 부실하거나 외국인 이름 음차라면 2순위 역자의 전공 및 커리어(중역 의심)를 적극 수용.
-3. '국내도서'라는 이유만으로 한국어로 판정 금지.
-
-출력형식:
-$h=[ISDS 코드]
-#reason=[어느 Track을 우선했는지 요약]"""
+        payload = {
+            "authors": authors_info,
+            "book": book_info,
+            "translators": translators_info,
+        }
 
         try:
             resp = self._client.chat.completions.create(
-                model=self._model, messages=[{"role": "system", "content": "사서용 비문학 하이브리드 추정기"}, {"role": "user", "content": prompt}], temperature=0
+                model=self._model, 
+                messages=[
+                    {"role": "system", "content": system}, 
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)}
+                ], 
+                temperature=0,
+                response_format={"type": "json_object"}
             )
-            content = (resp.choices[0].message.content or "").strip()
-            code, reason, _ = _extract_code_and_reason(content, "$h")
+            content = (resp.choices[0].message.content or "{}").strip()
+            result = json.loads(content)
+            
+            code = result.get("isds_code", "und")
+            reason = result.get("reasoning_process", "사유 없음")
+            
             if code in ALLOWED_CODES:
                 self._dbg(f"📘 [{label}] 확정: {code} (사유: {reason})")
                 return code
             return None
         except Exception as e:
-            self._dbg_err(f"GPT 하이브리드 오류: {e}")
+            self._dbg_err(f"GPT 하이브리드 JSON 처리 오류: {e}")
             return None
 
     def determine_h_language(self, title: str, original_title: str, category_text: str, publisher: str, author: str, translator: str, subject_lang: str, item_id: str = "") -> str:
